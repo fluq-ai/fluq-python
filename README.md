@@ -1,114 +1,200 @@
 # fluq-sdk
 
-Python SDK for [Fluq](https://fluq.ai) — AI agent fleet observability and control.
+Python SDK for the [Fluq](https://fluq.ai) agent observability platform.
 
-Fluq tells you what your agents **did**, not just what they said. Observe every action, enforce policies, and orchestrate tasks across your entire agent fleet.
-
-## Install
-
-```bash
+```
 pip install fluq-sdk
 ```
 
-## Quick Start
+## Quick start
+
+```python
+import fluq
+
+fluq.init(api_key="fo_xxx", agent_id="my-agent")
+
+# Wrap an OpenAI client for automatic LLM call tracing
+import openai
+client = fluq.watch(openai.OpenAI())
+
+# All calls are now captured
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+
+fluq.flush()
+```
+
+## Framework integrations
+
+### OpenAI Agents SDK
+
+```
+pip install fluq-sdk[openai-agents]
+```
+
+```python
+import fluq
+from fluq.integrations.openai_agents import FluqTracingProcessor
+
+fluq.init(api_key="fo_xxx", agent_id="support-agent")
+processor = FluqTracingProcessor()
+
+from agents import Agent, Runner, RunConfig
+
+agent = Agent(name="support", instructions="You are a helpful customer support agent.")
+result = Runner.run_sync(
+    agent,
+    "What is your return policy?",
+    run_config=RunConfig(tracing_processors=[processor]),
+)
+print(result.final_output)
+fluq.flush()
+```
+
+**Event mapping:**
+
+| Span type | Fluq event |
+|-----------|------------|
+| `AgentSpanData` | `action` |
+| `GenerationSpanData` | `llm_call` |
+| `FunctionSpanData` | `tool_use` |
+| `HandoffSpanData` | `spawn` |
+| `GuardrailSpanData` | `decision` |
+
+---
+
+### CrewAI
+
+```
+pip install fluq-sdk[crewai]
+```
+
+```python
+import fluq
+from fluq.integrations.crewai import FluqCrewHandler
+
+fluq.init(api_key="fo_xxx", agent_id="research-crew")
+handler = FluqCrewHandler()
+
+from crewai import Agent, Task, Crew, Process
+
+researcher = Agent(role="Researcher", goal="Research AI trends", backstory="...")
+writer = Agent(role="Writer", goal="Write summaries", backstory="...")
+
+crew = Crew(
+    agents=[researcher, writer],
+    tasks=[...],
+    process=Process.sequential,
+    callbacks=[handler],
+)
+result = crew.kickoff()
+fluq.flush()
+```
+
+**Event mapping:**
+
+| Callback | Fluq event |
+|----------|------------|
+| `on_chain_start` / `on_chain_end` | `action` |
+| `on_llm_end` | `llm_call` |
+| `on_tool_end` | `tool_use` |
+| `on_agent_action` | `action` |
+| `on_agent_finish` | `decision` |
+| `on_*_error` | `error` |
+
+The handler propagates `run_id` → `parent_run_id` relationships so all events
+within a single crew run share one `trace_id`.
+
+---
+
+### LangChain / LangGraph
+
+```
+pip install fluq-sdk[langchain]
+```
+
+```python
+import fluq
+from fluq.integrations.langchain import FluqCallbackHandler
+
+fluq.init(api_key="fo_xxx", agent_id="research-agent")
+handler = FluqCallbackHandler()
+
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+
+# Attach at the LLM level
+llm = ChatOpenAI(model="gpt-4o-mini", callbacks=[handler])
+response = llm.invoke([HumanMessage(content="What is observability?")])
+fluq.flush()
+```
+
+Attach at the chain level for full-chain traces:
+
+```python
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+
+chain = ChatPromptTemplate.from_messages([("human", "{q}")]) | llm | StrOutputParser()
+result = chain.invoke({"q": "Explain RAG."}, config={"callbacks": [handler]})
+fluq.flush()
+```
+
+**Event mapping:**
+
+| Callback | Fluq event |
+|----------|------------|
+| `on_chain_start` / `on_chain_end` | `action` |
+| `on_llm_end` / `on_chat_model_start` + `on_llm_end` | `llm_call` |
+| `on_tool_end` | `tool_use` |
+| `on_agent_action` | `action` |
+| `on_agent_finish` | `decision` |
+| `on_*_error` | `error` |
+
+---
+
+## Manual traces and events
 
 ```python
 import asyncio
+import fluq
 from fluq import Fluq, FluqConfig, TraceInput, EventInput, EventType
 
 async def main():
     client = Fluq()
     client.init(FluqConfig(
-        api_key="fo_your_api_key",
+        api_key="fo_xxx",
         agent_id="my-agent",
-        capabilities=["code", "search"],
-        base_url="https://fluq.ai",
+        capabilities=["research", "writing"],
     ))
 
-    # Create a trace for a unit of work
-    async with await client.trace(TraceInput(name="process-request")) as trace:
-        # Log events as your agent works
-        trace.event(EventInput(
+    async with await client.trace(TraceInput(name="research_run")) as trace:
+        client.event(EventInput(
             trace_id=trace.id,
-            event_type=EventType.LLM_CALL,
-            input={"prompt": "Analyze this data"},
-            output={"response": "Here's the analysis..."},
-            tokens_in=150,
-            tokens_out=420,
-            estimated_cost_usd=0.003,
+            event_type=EventType.ACTION,
+            payload={"step": "web_search", "query": "latest AI news"},
         ))
-
-        trace.event(EventInput(
-            trace_id=trace.id,
-            event_type=EventType.TOOL_USE,
-            resource="database",
-            metadata={"query": "SELECT * FROM users"},
-            duration_ms=45.2,
-        ))
+        # ... do work ...
 
     await client.destroy()
 
 asyncio.run(main())
 ```
 
-## Features
+## Install options
 
-- **Auto-batched events** — events are buffered and sent in batches for performance
-- **Trace context manager** — `async with` automatically captures errors
-- **Task queue** — pull tasks from the fleet queue and report completion
-- **Retry with backoff** — transient failures are retried automatically
-- **Typed** — full type hints, `py.typed` marker included
-
-## Event Types
-
-| Type | Description |
-|------|-------------|
-| `llm_call` | LLM API calls with token counts and cost |
-| `tool_use` | Tool/function invocations |
-| `action` | General agent actions |
-| `decision` | Decision points |
-| `spawn` | Child agent/process spawns |
-| `api_call` | External API calls |
-| `file_read` / `file_write` | File system operations |
-| `error` | Errors and exceptions |
-| `cost` | Cost tracking events |
-| `heartbeat` | Agent health signals |
-| `conflict` | Resource conflict detection |
-
-## Task Queue
-
-```python
-# Pull and complete tasks
-task = await client.pull_task()
-if task:
-    print(f"Working on: {task.name}")
-    # ... do the work ...
-    await client.complete_task(task.id)
-```
-
-## Configuration
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `api_key` | required | Your Fluq API key (`fo_...`) |
-| `agent_id` | required | Unique identifier for this agent |
-| `capabilities` | required | List of agent capabilities |
-| `base_url` | `https://api.fluq.dev` | Fluq API base URL |
-| `flush_interval_ms` | `1000` | Auto-flush interval |
-| `flush_batch_size` | `50` | Max events per batch |
-| `max_retries` | `3` | Retry attempts for failed requests |
-
-## Requirements
-
-- Python 3.11+
-- `httpx` for async HTTP
+| Extra | Installs |
+|-------|---------|
+| `fluq-sdk` | Core SDK only — no framework deps |
+| `fluq-sdk[openai-agents]` | + `openai-agents>=0.1.0` |
+| `fluq-sdk[crewai]` | + `crewai>=0.60.0` |
+| `fluq-sdk[langchain]` | + `langchain-core>=0.3.0` |
+| `fluq-sdk[all]` | All of the above |
 
 ## Links
 
-- [Dashboard](https://fluq.ai/dashboard)
-- [Documentation](https://fluq.ai/docs)
-- [TypeScript SDK](https://github.com/fluq-ai/fluq-js)
-
-## License
-
-MIT
+- [Dashboard](https://fluq.ai)
+- [Docs](https://docs.fluq.ai/sdk/python)
+- [GitHub](https://github.com/fluq-ai/fluq-python)

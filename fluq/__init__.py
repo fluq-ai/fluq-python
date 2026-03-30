@@ -1,12 +1,16 @@
 """Fluq Python SDK — observability client for agent fleets.
 
 Context manager for traces, auto-batched events, and task management.
+Auto-instrumentation: ``fluq.init()`` + ``fluq.watch(client)`` captures LLM calls.
 """
 
 from __future__ import annotations
 
+import atexit
 import asyncio
+import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -409,3 +413,198 @@ def _try_json(resp: httpx.Response) -> Any:
         return resp.json()
     except Exception:
         return resp.text
+
+
+# ======================================================================
+# Module-level auto-instrumentation API
+# ======================================================================
+
+@dataclass
+class _ModuleState:
+    api_key: str
+    agent_id: str
+    base_url: str
+    http: httpx.Client
+    buffer: list[dict[str, Any]]
+    lock: threading.Lock
+    flush_batch_size: int
+
+
+_state: _ModuleState | None = None
+
+
+def init(
+    *,
+    api_key: str,
+    agent_id: str,
+    base_url: str = "https://api.fluq.dev",
+    flush_batch_size: int = 50,
+) -> None:
+    """Initialize the module-level auto-instrumentation.
+
+    Must be called before ``watch()``.
+    """
+    global _state
+    if _state is not None:
+        _state.http.close()
+    _state = _ModuleState(
+        api_key=api_key,
+        agent_id=agent_id,
+        base_url=base_url.rstrip("/"),
+        http=httpx.Client(),
+        buffer=[],
+        lock=threading.Lock(),
+        flush_batch_size=flush_batch_size,
+    )
+    atexit.register(flush)
+
+
+def flush() -> None:
+    """Flush all buffered auto-instrumentation events."""
+    if _state is None:
+        return
+    with _state.lock:
+        if not _state.buffer:
+            return
+        events = _state.buffer[:]
+        _state.buffer.clear()
+    try:
+        _state.http.post(
+            f"{_state.base_url}/api/v1/events",
+            json={"events": events},
+            headers={
+                "Authorization": f"Bearer {_state.api_key}",
+                "Content-Type": "application/json",
+            },
+        )
+    except Exception:
+        # Best-effort: don't crash the user's app
+        pass
+
+
+def _emit_event(
+    *,
+    trace_id: str,
+    event_type: str,
+    resource: str | None = None,
+    input_data: dict[str, Any] | None = None,
+    output_data: dict[str, Any] | None = None,
+    payload: dict[str, Any] | None = None,
+    metadata: dict[str, Any] | None = None,
+    duration_ms: float | None = None,
+    tokens_in: int | None = None,
+    tokens_out: int | None = None,
+    estimated_cost_usd: float | None = None,
+    error_message: str | None = None,
+) -> None:
+    """Buffer an arbitrary event from integrations."""
+    if _state is None:
+        return
+    event: dict[str, Any] = {
+        "agentId": _state.agent_id,
+        "traceId": trace_id,
+        "eventType": event_type,
+    }
+    if resource is not None:
+        event["resource"] = resource
+    if input_data is not None:
+        event["input"] = input_data
+    if output_data is not None:
+        event["output"] = output_data
+    if payload is not None:
+        event["payload"] = payload
+    if metadata is not None:
+        event["metadata"] = metadata
+    if duration_ms is not None:
+        event["durationMs"] = round(duration_ms, 2)
+    if tokens_in is not None:
+        event["tokensIn"] = tokens_in
+    if tokens_out is not None:
+        event["tokensOut"] = tokens_out
+    if estimated_cost_usd is not None:
+        event["estimatedCostUsd"] = estimated_cost_usd
+    if error_message is not None:
+        event["errorMessage"] = error_message
+
+    with _state.lock:
+        _state.buffer.append(event)
+        should_flush = len(_state.buffer) >= _state.flush_batch_size
+    if should_flush:
+        flush()
+
+
+def _emit_llm_event(
+    *,
+    model: str,
+    provider: str,
+    input_data: dict[str, Any] | None,
+    output_data: dict[str, Any] | None,
+    tokens_in: int,
+    tokens_out: int,
+    estimated_cost_usd: float | None,
+    duration_ms: float,
+    error_message: str | None,
+) -> None:
+    """Buffer an llm_call event from auto-instrumentation."""
+    if _state is None:
+        return
+    trace_id = str(uuid.uuid4())
+    event: dict[str, Any] = {
+        "agentId": _state.agent_id,
+        "traceId": trace_id,
+        "eventType": "llm_call",
+        "resource": f"{provider}.{model}",
+        "durationMs": round(duration_ms, 2),
+        "tokensIn": tokens_in,
+        "tokensOut": tokens_out,
+        "metadata": {"provider": provider, "model": model},
+    }
+    if input_data is not None:
+        event["input"] = input_data
+    if output_data is not None:
+        event["output"] = output_data
+    if estimated_cost_usd is not None:
+        event["estimatedCostUsd"] = estimated_cost_usd
+    if error_message is not None:
+        event["errorMessage"] = error_message
+
+    with _state.lock:
+        _state.buffer.append(event)
+        should_flush = len(_state.buffer) >= _state.flush_batch_size
+    if should_flush:
+        flush()
+
+
+def watch(client: Any) -> Any:
+    """Wrap an OpenAI or Anthropic client to auto-capture LLM calls.
+
+    Returns an instrumented proxy that behaves identically to the original
+    client but emits ``llm_call`` events for every completion request.
+
+    Supports: ``openai.OpenAI``, ``openai.AsyncOpenAI``,
+    ``anthropic.Anthropic``, ``anthropic.AsyncAnthropic``.
+    """
+    if _state is None:
+        raise RuntimeError("fluq.init() must be called before fluq.watch()")
+
+    cls_module = type(client).__module__ or ""
+    cls_name = type(client).__name__
+
+    if cls_module.startswith("openai"):
+        if "Async" in cls_name:
+            from .instruments.openai import AsyncOpenAIProxy
+            return AsyncOpenAIProxy(client, _emit_llm_event)
+        from .instruments.openai import OpenAIProxy
+        return OpenAIProxy(client, _emit_llm_event)
+
+    if cls_module.startswith("anthropic"):
+        if "Async" in cls_name:
+            from .instruments.anthropic import AsyncAnthropicProxy
+            return AsyncAnthropicProxy(client, _emit_llm_event)
+        from .instruments.anthropic import AnthropicProxy
+        return AnthropicProxy(client, _emit_llm_event)
+
+    raise TypeError(
+        f"Unsupported client type: {cls_module}.{cls_name}. "
+        "Expected an OpenAI or Anthropic client."
+    )
