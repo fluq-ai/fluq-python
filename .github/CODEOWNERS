@@ -1,0 +1,8 @@
+# Default owner — every PR needs review from this account
+*                @mariano-fluq
+
+# Extra-sensitive paths (defense in depth, even though * already covers them)
+/.github/        @mariano-fluq
+/pyproject.toml  @mariano-fluq
+/setup.py        @mariano-fluq
+/setup.cfg       @mariano-fluq
